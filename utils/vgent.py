@@ -14,6 +14,9 @@ from utils.retrieval import compute_text_similarity, extract_choices, allocate_n
 from models.utils import resize_video
 
 MODEL_MAP = {
+    # OpenAI backend (bench addition): runs every LVLM role through the API so
+    # Vgent needs no local vision model. See models/openai_vlm.py.
+    "openai":         ("models.openai_vlm", "gpt-4o"),
     "llava_video":    ("models.llavavideo", "lmms-lab/LLaVA-Video-7B-Qwen2"),
     "qwenvl25_7b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-7B-Instruct"),
     "qwenvl25_3b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-3B-Instruct"),
@@ -84,8 +87,15 @@ class Vgent():
                     entity_graph[entity_name].add(idx)
                     continue
                 entity_sim = compute_text_similarity([entity], list(entity_graph.keys()), self.embedding_model, self.embedding_tokenizer, return_all=True)
-                max_sim_idx = max(range(len(entity_sim)), key=lambda i: entity_sim[i])
-                max_sim = entity_sim[0][max_sim_idx]
+                # [BENCH REPAIR] compute_text_similarity returns shape (1, n_keys);
+                # the original took max over range(len(entity_sim)) == range(1), so
+                # max_sim_idx was always 0 -- every entity was compared only against
+                # the FIRST entity ever added, never the most similar one, so the
+                # graph almost never linked clips (17 edges / 100 clips; 0 on the
+                # concatenated corpus). Argmax over the actual key axis, entity_sim[0].
+                sims_row = entity_sim[0]
+                max_sim_idx = max(range(len(sims_row)), key=lambda i: sims_row[i])
+                max_sim = sims_row[max_sim_idx]
                 if max_sim > 0.7:
                     most_similar_entity = list(entity_graph.keys())[max_sim_idx]
                     entity_graph[most_similar_entity].add(idx)

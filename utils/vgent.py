@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import ast
 import importlib
@@ -14,9 +15,9 @@ from utils.retrieval import compute_text_similarity, extract_choices, allocate_n
 from models.utils import resize_video
 
 MODEL_MAP = {
-    # OpenAI backend (bench addition): runs every LVLM role through the API so
-    # Vgent needs no local vision model. See models/openai_vlm.py.
-    "openai":         ("models.openai_vlm", "gpt-4o"),
+    # OpenAI backend: every LVLM role in the pipeline goes through the API, so
+    # no local vision model is needed. See models/openai_vlm.py.
+    "openai":         ("models.openai_vlm", os.environ.get("VGENT_VISION_MODEL", "gpt-4o-mini")),
     "llava_video":    ("models.llavavideo", "lmms-lab/LLaVA-Video-7B-Qwen2"),
     "qwenvl25_7b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-7B-Instruct"),
     "qwenvl25_3b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-3B-Instruct"),
@@ -25,6 +26,37 @@ MODEL_MAP = {
     "internvl25_2b":  ("models.internvl", "OpenGVLab/InternVL2_5-2B"),
     "longvu":         ("models.longvu", "Vision-CAIR/LongVU_Qwen2_7B"),
 }
+
+def _loads(s):
+    """json.loads, optionally falling back to ast.literal_eval.
+
+    The released code parses every LVLM reply with json.loads. But REASONING_PROMPT's
+    own few-shot example is not valid JSON -- it writes
+
+        {"multiple": "no", ..., "tool": 'none', 'candidates_necessary': 'yes'}
+
+    with single-quoted values and keys. The LVLM copies the example faithfully, so
+    json.loads rejects the reply. Measured on Qwen2.5-VL-3B over 20 LongVideoBench
+    questions: json.loads parses 2/20, ast.literal_eval parses 20/20. When parsing
+    fails, extract_keywords returns llm_info=None, which in turn makes refine_nodes
+    return early -- i.e. structured reasoning never runs.
+
+    This module already imports `ast` and never uses it, which suggests the parse
+    was ast.literal_eval at some point. Setting VGENT_PARSE_FALLBACK=1 restores it.
+    Default OFF, so the as-released behaviour is bit-for-bit unchanged.
+    """
+    try:
+        return json.loads(s)
+    except Exception:
+        if os.environ.get("VGENT_PARSE_FALLBACK") != "1":
+            raise
+    try:
+        return ast.literal_eval(s)
+    except Exception as e:
+        # generate_entities only catches (JSONDecodeError, KeyError, TypeError);
+        # ast raises ValueError/SyntaxError, which would escape and kill the run.
+        raise json.JSONDecodeError(f"ast fallback failed: {e}", s, 0)
+
 
 class Vgent():
     def __init__(self, args):
@@ -43,13 +75,23 @@ class Vgent():
         self.processor, self.video_llm, self.image_processor, _ = self.load_model(model_path)
         self.embedding_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-large-en-v1.5')
         self.embedding_model = AutoModel.from_pretrained('BAAI/bge-large-en-v1.5')
+        # PERFORMANCE ONLY -- same model, same fp32 math, different device.
+        # construct_graph calls compute_text_similarity once per extracted
+        # entity, re-encoding every accumulated entity key each time, so the
+        # cost grows quadratically in graph size. On CPU that made graph
+        # construction 88% of runtime (46 s/clip with two jobs contending for
+        # cores, vs 13.9 s/clip uncontended). Nothing about the retrieval
+        # results changes; only where the matmuls run.
+        if torch.cuda.is_available():
+            self.embedding_model = self.embedding_model.cuda()
+        self.embedding_model.eval()
     
     def generate_entities(self, prompt, video_input, max_new_tokens=512):
         attempts = 0
         while attempts < 5:
             try:
                 response = self.mllm_response(self.video_llm, self.processor, self.image_processor, prompt, None, video_input, max_new_tokens)
-                info = json.loads(response.replace("```json", "").replace("```","").strip())
+                info = _loads(response.replace("```json", "").replace("```","").strip())
                 
                 entities = [f"{entity['entity name']}, {entity['description']}" 
                             for entity in info.get("entities", []) 
@@ -87,15 +129,23 @@ class Vgent():
                     entity_graph[entity_name].add(idx)
                     continue
                 entity_sim = compute_text_similarity([entity], list(entity_graph.keys()), self.embedding_model, self.embedding_tokenizer, return_all=True)
-                # [BENCH REPAIR] compute_text_similarity returns shape (1, n_keys);
-                # the original took max over range(len(entity_sim)) == range(1), so
-                # max_sim_idx was always 0 -- every entity was compared only against
-                # the FIRST entity ever added, never the most similar one, so the
-                # graph almost never linked clips (17 edges / 100 clips; 0 on the
-                # concatenated corpus). Argmax over the actual key axis, entity_sim[0].
-                sims_row = entity_sim[0]
-                max_sim_idx = max(range(len(sims_row)), key=lambda i: sims_row[i])
-                max_sim = sims_row[max_sim_idx]
+                # AS RELEASED: compute_text_similarity returns shape
+                # (1, n_keys), so `range(len(entity_sim))` is range(1) and
+                # max_sim_idx is always 0 -- every entity is compared only
+                # against the FIRST entity ever added, never the most similar
+                # one. The graph therefore almost never links clips (measured
+                # 17 edges / 100 clips; 0 on a concatenated corpus).
+                # VGENT_ENTITY_ARGMAX=1 takes the argmax over the real key axis.
+                # Default OFF, so the released behaviour is bit-for-bit intact.
+                if os.environ.get("VGENT_ENTITY_ARGMAX") == "1":
+                    sims_row = entity_sim[0]
+                    max_sim_idx = max(range(len(sims_row)),
+                                      key=lambda i: sims_row[i])
+                    max_sim = sims_row[max_sim_idx]
+                else:
+                    max_sim_idx = max(range(len(entity_sim)),
+                                      key=lambda i: entity_sim[i])
+                    max_sim = entity_sim[0][max_sim_idx]
                 if max_sim > 0.7:
                     most_similar_entity = list(entity_graph.keys())[max_sim_idx]
                     entity_graph[most_similar_entity].add(idx)
@@ -113,7 +163,7 @@ class Vgent():
         while flag and count < 5:
             try:
                 response = self.mllm_response(self.video_llm, self.processor, self.image_processor, reason_prompt, None, None, max_new_tokens=256)
-                llm_info = json.loads(response.replace("```json", "").replace("```","").strip())
+                llm_info = _loads(response.replace("```json", "").replace("```","").strip())
                 flag = False
             except:
                 count += 1
@@ -186,7 +236,7 @@ class Vgent():
             while flag and count < 5:
                 try:
                     response = self.mllm_response(self.video_llm, self.processor, self.image_processor, prompt, None, None, 512)
-                    info.update(json.loads(response.replace("```json", "").replace("```","").strip()))
+                    info.update(_loads(response.replace("```json", "").replace("```","").strip()))
                     flag = False
                 except:
                     count += 1
@@ -213,7 +263,7 @@ class Vgent():
             instruct = SQL_ANSWER_COUNT_PROMPT.format(questions=info) + subtitle_prompt if obj_count else SQL_ANSWER_PROMPT.format(questions=info) + subtitle_prompt
             try:
                 output_text = self.mllm_response(self.video_llm, self.processor, self.image_processor, instruct, None, video_input, max_new_tokens=256, size_list=size_list_input)
-                pred = json.loads(output_text.replace("```json", "").replace("```","").strip())
+                pred = _loads(output_text.replace("```json", "").replace("```","").strip())
             except:
                 pred = None
             check_result[node] = pred

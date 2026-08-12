@@ -7,6 +7,9 @@ from models.utils import resize_video
 
 def compute_text_similarity(query_list, key_list, embedding_model, tokenizer, return_all=False):
     encoded_input = tokenizer(query_list + key_list, padding=True, truncation=True, return_tensors='pt')
+    # Follow whatever device the embedder was placed on (see Vgent.__init__).
+    device = next(embedding_model.parameters()).device
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
     with torch.no_grad():
         model_output = embedding_model(**encoded_input)
         embeddings = model_output[0][:, 0]

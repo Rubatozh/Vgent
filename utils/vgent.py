@@ -149,6 +149,19 @@ class Vgent():
                 if max_sim > 0.7:
                     most_similar_entity = list(entity_graph.keys())[max_sim_idx]
                     entity_graph[most_similar_entity].add(idx)
+                    # BENCH SEAM BEGIN (comment only -- no behaviour)
+                    # These EDGES ARE NEVER TRAVERSED -- not here, not upstream,
+                    # and not in the paper. Retrieval (Eq. 4) reads only the
+                    # entity->clips map U(v): `allocate_node` unions the clips
+                    # of every entity whose key matches a keyword, then ranks
+                    # candidates by each clip's own text. Nothing in the
+                    # codebase calls .edges/.neighbors/.successors. So the graph
+                    # is operationally a bipartite index plus a per-clip
+                    # attribute store, and "connects clips via shared entities"
+                    # means they share a bucket, not that a path is walked.
+                    # Faithful to the paper, kept as-is; noted so a future
+                    # reader does not go looking for the traversal.
+                    # BENCH SEAM END
                     video_graph.add_edges_from((idx, i, {"label": most_similar_entity}) for i in entity_graph[most_similar_entity])
 
                 else:
